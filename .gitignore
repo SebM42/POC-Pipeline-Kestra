@@ -1,3 +1,10 @@
+# custom
+test_pipeline.ipynb
+kestra-postgres-data/
+kestra_data/
+tmp/
+tasks/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

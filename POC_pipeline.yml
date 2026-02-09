@@ -1,0 +1,300 @@
+id: POC_pipeline
+namespace: oc
+
+triggers:
+  - id: monthly_trigger
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+
+tasks:
+  # STEP 0 : convert to parquet (test included)
+  - id: convert_xls_to_parquet
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: custom-python-312:latest
+    outputFiles:
+      - "*"
+    script: |
+      import requests
+      import zipfile
+      import io
+      import os
+      import duckdb
+      import pandas as pd
+      from pathlib import Path
+      from datetime import datetime
+
+      url = "https://s3.eu-west-1.amazonaws.com/course.oc-static.com/projects/922_Data+Engineer/922_P10/bottleneck.zip"
+
+      src_path = Path("/app/data/src")
+      os.makedirs(src_path, exist_ok=True)
+
+      response = requests.get(url)
+      response.raise_for_status()
+
+      with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+          for member in zip_file.namelist():
+              filename = os.path.basename(member)
+              if filename: 
+                  source = zip_file.open(member)
+                  target_path = os.path.join(src_path, filename)
+                  with open(target_path, "wb") as target:
+                      with source:
+                          target.write(source.read())
+
+      erp = pd.read_excel(src_path / 'Fichier_erp.xlsx')
+      link = pd.read_excel(src_path / 'fichier_liaison.xlsx')
+      web = pd.read_excel(src_path / 'Fichier_web.xlsx')
+      link['id_web'] = link['id_web'].astype('string')
+      web['sku'] = web['sku'].astype('string')
+
+
+      erp.to_parquet("fichier_erp.parquet", index=False, engine='fastparquet')
+      link.to_parquet("fichier_liaison.parquet", index=False, engine='fastparquet')
+      web.to_parquet("fichier_web.parquet", index=False, engine='fastparquet')
+
+      # TEST
+      dataframes = [erp,link,web]
+      parquets = ['fichier_erp.parquet', 'fichier_liaison.parquet', 'fichier_web.parquet']
+      conn = duckdb.connect()
+
+      for d,p in zip(dataframes,parquets):
+        assert d.shape == conn.execute(f"SELECT * FROM '{p}'").fetchdf().shape
+
+  # STEP 1 : cleaning
+  - id: remove_nan
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      erp.parquet: "{{ outputs.convert_xls_to_parquet.outputFiles['fichier_erp.parquet'] }}"
+      link.parquet: "{{ outputs.convert_xls_to_parquet.outputFiles['fichier_liaison.parquet'] }}"
+      web.parquet: "{{ outputs.convert_xls_to_parquet.outputFiles['fichier_web.parquet'] }}"
+    outputFiles:
+      - erp_no_nan.parquet
+      - link_no_nan.parquet
+      - web_no_nan.parquet
+    fetchType: 'FETCH'
+    sql: |
+      COPY (
+        SELECT *
+        FROM 'erp.parquet'
+        WHERE product_id IS NOT NULL
+      ) TO '{{ outputFiles['erp_no_nan.parquet'] }}' (FORMAT parquet);
+      
+      COPY (
+        SELECT *
+        FROM 'link.parquet'
+        WHERE product_id IS NOT NULL AND id_web IS NOT NULL
+      ) TO '{{ outputFiles['link_no_nan.parquet'] }}' (FORMAT parquet);
+
+      COPY (
+        SELECT *
+        FROM 'web.parquet'
+        WHERE sku IS NOT NULL
+      ) TO '{{ outputFiles['web_no_nan.parquet'] }}' (FORMAT parquet);
+
+      SELECT *
+      FROM read_parquet('{{ outputFiles['erp_no_nan.parquet'] }}')
+      WHERE product_id IS NULL;
+
+      SELECT *
+      FROM read_parquet('{{ outputFiles['link_no_nan.parquet'] }}')
+      WHERE product_id IS NULL OR id_web IS NULL;
+
+      SELECT *
+      FROM read_parquet('{{ outputFiles['web_no_nan.parquet'] }}')
+      WHERE sku IS NULL;
+
+      -- FOR FINAL TEST
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['web_no_nan.parquet'] }}')
+  
+  # STEP 1 TEST
+  - id: assert_no_nan
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.remove_nan.outputs[0].rows | length == 0 }}"
+      - "{{ outputs.remove_nan.outputs[1].rows | length == 0 }}"
+      - "{{ outputs.remove_nan.outputs[2].rows | length == 0 }}"
+
+  # STEP 2 : removing duplicates
+  - id: remove_duplicates
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      erp.parquet: "{{ outputs.remove_nan.outputFiles['erp_no_nan.parquet'] }}"
+      link.parquet: "{{ outputs.remove_nan.outputFiles['link_no_nan.parquet'] }}"
+      web.parquet: "{{ outputs.remove_nan.outputFiles['web_no_nan.parquet'] }}"
+    outputFiles:
+      - erp_no_nan_no_duplicates.parquet
+      - link_no_nan_no_duplicates.parquet
+      - web_no_nan_no_duplicates.parquet
+    fetchType: 'FETCH'
+    sql: |
+      COPY (
+        SELECT DISTINCT *
+        FROM 'erp.parquet'
+      ) TO '{{ outputFiles['erp_no_nan_no_duplicates.parquet'] }}' (FORMAT parquet);
+      
+      COPY (
+        SELECT DISTINCT *
+        FROM 'link.parquet'
+      ) TO '{{ outputFiles['link_no_nan_no_duplicates.parquet'] }}' (FORMAT parquet);
+
+      COPY (
+        SELECT DISTINCT *
+        FROM 'web.parquet'
+        WHERE post_type = 'product'
+      ) TO '{{ outputFiles['web_no_nan_no_duplicates.parquet'] }}' (FORMAT parquet);
+
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['erp_no_nan_no_duplicates.parquet'] }}')
+      GROUP BY product_id
+      HAVING c > 1;
+
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['link_no_nan_no_duplicates.parquet'] }}')
+      GROUP BY product_id, id_web
+      HAVING c > 1;
+
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['web_no_nan_no_duplicates.parquet'] }}')
+      GROUP BY sku
+      HAVING c > 1;
+
+      -- FOR FINAL TEST
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['erp_no_nan_no_duplicates.parquet'] }}');
+
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['link_no_nan_no_duplicates.parquet'] }}');
+
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['web_no_nan_no_duplicates.parquet'] }}');
+
+  # STEP 2 TEST
+  - id: assert_no_duplicates
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.remove_duplicates.outputs[0].rows | length == 0 }}"
+      - "{{ outputs.remove_duplicates.outputs[1].rows | length == 0 }}"
+      - "{{ outputs.remove_duplicates.outputs[2].rows | length == 0 }}"
+
+  # STEP 3 : merging
+  - id: merge
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    inputFiles:
+      erp.parquet: "{{ outputs.remove_duplicates.outputFiles['erp_no_nan_no_duplicates.parquet'] }}"
+      link.parquet: "{{ outputs.remove_duplicates.outputFiles['link_no_nan_no_duplicates.parquet'] }}"
+      web.parquet: "{{ outputs.remove_duplicates.outputFiles['web_no_nan_no_duplicates.parquet'] }}"
+    outputFiles:
+      - merged.parquet
+    fetchType: 'FETCH'
+    sql: |
+      COPY (
+        SELECT *
+        FROM 'erp.parquet'
+        INNER JOIN 'link.parquet' on erp.product_id = link.product_id
+        INNER JOIN 'web.parquet' on web.sku = link.id_web
+      ) TO '{{ outputFiles['merged.parquet'] }}' (FORMAT parquet);
+
+      SELECT count(*) as c
+      FROM read_parquet('{{ outputFiles['merged.parquet'] }}');
+
+      SELECT count(*) as c
+      FROM read_parquet('erp.parquet');
+
+      SELECT count(*) as c
+      FROM read_parquet('link.parquet');
+
+      SELECT count(*) as c
+      FROM read_parquet('web.parquet');
+  
+  # STEP 3 TEST
+  - id: assert_merge_consistency
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.merge.outputs[0].rows[0].c <= min(outputs.merge.outputs[1].rows[0].c, outputs.merge.outputs[2].rows[0].c, outputs.merge.outputs[3].rows[0].c) }}"
+
+  # STEP 4 : calculating and exporting
+  - id: parallel_tasks
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      # STEP 4-a : calculating revenue per product + total revenue and exporting results in csv
+      - id: branch-revenues
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+        - id: export_revenue_per_product_and_total_revenue_to_csv
+          type: io.kestra.plugin.jdbc.duckdb.Queries
+          inputFiles:
+            merge.parquet: "{{ outputs.merge.outputFiles['merged.parquet'] }}"
+          outputFiles:
+            - revenue_per_product.csv
+          fetchType: 'FETCH'
+          sql: |
+            COPY (
+              SELECT *
+              FROM  (SELECT '' as sku, 'TOTAL' as title, '' as total_sales, '' as price, SUM(ROUND(total_sales * price,2)) as total_revenue
+                    FROM 'merge.parquet'
+                    UNION
+                    SELECT sku, post_title as title, total_sales, price, ROUND(total_sales * price,2) as total_revenue
+                    FROM  (SELECT sku, post_title, SUM(total_sales) as total_sales, price
+                          FROM 'merge.parquet'
+                          GROUP BY sku, post_title, price) as t2
+                    ) as f
+              ORDER BY total_revenue DESC
+            ) TO '{{ outputFiles['revenue_per_product.csv'] }}' (FORMAT csv);
+
+            SELECT 0, SUM(total_revenue) as total_revenue
+            FROM  (SELECT sku, total_sales, price, total_sales * price as total_revenue
+                  FROM 'merge.parquet') as t2;
+
+            -- FOR FINAL TEST
+            SELECT ROUND(SUM(total_sales * price),2) as total_revenue
+            FROM 'merge.parquet';
+        # STEP 4-a TEST
+        - id: assert_total_revenue_consistency
+          type: io.kestra.plugin.core.execution.Assert
+          conditions:
+            - "{{ outputs.export_revenue_per_product_and_total_revenue_to_csv.outputs[1].rows[0].total_revenue }} > 10000"
+            - "{{ outputs.export_revenue_per_product_and_total_revenue_to_csv.outputs[1].rows[0].total_revenue }} < 1000000"
+      
+      # STEP 4-b : calculating z-score per product, separating results (vintage and common) and exporting results in csv (test included)
+      - id: export_wines_list_to_csv
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: custom-python-312:latest
+        inputFiles:
+          merge.parquet: "{{ outputs.merge.outputFiles['merged.parquet'] }}"
+        outputFiles:
+          - vintage_list.csv
+          - common_list.csv
+        script: |
+          import pandas as pd
+          import duckdb as ddb
+          from scipy.stats import zscore
+          from kestra import Kestra
+
+          conn = ddb.connect()
+          query = "SELECT sku, post_title, SUM(total_sales) as total_sales, price FROM 'merge.parquet' GROUP BY sku, post_title, price"
+          df = conn.execute(query).fetchdf()
+
+          df['total_ca'] = df['total_sales'].astype('float') * df['price'].astype('float')
+          df['zscore'] = zscore(df['price'])
+
+          df[df['zscore'] > 2].sort_values('zscore',ascending=False).to_csv('vintage_list.csv', sep=',', index=False)
+          df[df['zscore'] <= 2].sort_values('zscore',ascending=False).to_csv('common_list.csv', sep=',', index=False)
+
+          # TEST
+          assert (df.shape[0] == pd.read_csv('vintage_list.csv', sep=',').shape[0] + pd.read_csv('common_list.csv', sep=',').shape[0])
+
+          # FOR FINAL TEST
+          Kestra.outputs({'vintage':df[df['zscore'] > 2].shape[0],'common':df[df['zscore'] <= 2].shape[0]})
+
+  # Final Check
+  - id: echo_results
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - "echo Erp row numbers after duplicates removal : {{ outputs.remove_duplicates.outputs[3].rows[0].c }}"
+      - "echo Link row numbers after duplicates removal : {{ outputs.remove_duplicates.outputs[4].rows[0].c }}"
+      - "echo Web row numbers after cleaning : {{ outputs.remove_nan.outputs[3].rows[0].c }}"
+      - "echo Web row numbers after duplicates removal : {{ outputs.remove_duplicates.outputs[5].rows[0].c }}"
+      - "echo Row numbers after merge : {{ outputs.merge.outputs[0].rows[0].c }}"
+      - "echo Total revenue : {{ outputs.export_revenue_per_product_and_total_revenue_to_csv.outputs[1].rows[0].total_revenue }}"
+      - "echo Vintage wines count : {{ outputs.export_wines_list_to_csv.vars.vintage }}"
