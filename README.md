@@ -5,19 +5,19 @@ This project demonstrates how to automate data ingestion, transformation, qualit
 
 **Table of contents**
 
-- [Project Goal](#🎯-project-goal)
-- [What This POC Demonstrates](#🧠-what-this-poc-demonstrates)
-- [Pipeline Architecture and Workflow](#🗂️-pipeline-architecture-and-workflow)
+- [Project Goal](#-project-goal)
+- [What This POC Demonstrates](#-what-this-poc-demonstrates)
+- [Pipeline Architecture and Workflow](#-pipeline-architecture-and-workflow)
 	- [Main steps](#main-steps)
 	- [Pipeline Diagram](#pipeline-diagram)
-- [Tech Stack](#⚙️-tech-stack)
-- [Running the Project](#🚀-running-the-project)
+- [Tech Stack](#-tech-stack)
+- [Running the Project](#-running-the-project)
 	- [Prerequisites](#prerequisites)
 	- [Start the services](#start-the-services)
 	- [Build Custom Python Image](#build-custom-python-image)
 	- [Import the yaml file](#import-the-yaml-file)
-- [Outputs and Results](#📊-outputs-and-results)
-- [Possible Improvements](#🔍-possible-improvements)
+- [Outputs and Results](#-outputs-and-results)
+- [Possible Improvements](#-possible-improvements)
 
 ---
 
@@ -121,8 +121,8 @@ The pipeline produces:
 - Cleaned and deduplicated datasets in Parquet format
 - A CSV file with revenue per product and total revenue
 - Two CSV files separating:
-	1. vintage products (high z-score)
-	2. common products
+	- vintage products (high z-score)
+	- common products
 - Execution logs, metrics, and assertions available in Kestra
 
 ## 🔍 Possible Improvements
