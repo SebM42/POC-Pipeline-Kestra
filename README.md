@@ -1,134 +1,106 @@
-# POC – Data Pipeline Automation with Kestra
+# Orchestrated Monthly Data Pipeline — Kestra & DuckDB
 
-Proof of Concept of a **data engineering pipeline** orchestrated with **Kestra**.  
-This project demonstrates how to automate data ingestion, transformation, quality checks, and analytics using containerized workflows.
-
-**Table of contents**
-
-- [Project Goal](#project-goal)
-- [What This POC Demonstrates](#what-this-poc-demonstrates)
-- [Pipeline Architecture and Workflow](#pipeline-architecture-and-workflow)
-	- [Main steps](#main-steps)
-	- [Pipeline Diagram](#pipeline-diagram)
-- [Tech Stack](#tech-stack)
-- [Running the Project](#running-the-project)
-	- [Prerequisites](#prerequisites)
-	- [Start the services](#start-the-services)
-	- [Build Custom Python Image](#build-custom-python-image)
-	- [Import the yaml file](#import-the-yaml-file)
-- [Outputs and Results](#outputs-and-results)
-- [Possible Improvements](#possible-improvements)
+`Python` `Kestra` `DuckDB` `Docker` `Parquet`
 
 ---
 
-## 🎯 Project Goal
+## Overview
 
-The goal of this POC is to design a **reproducible and automated data pipeline** that:
-- ingests raw business data
-- transforms it into analytics-ready formats
-- enforces data quality checks at each step
-- produces datasets and metrics ready for business analysis
+Monthly data pipeline orchestrated with Kestra — covering ingestion, transformation, deduplication, data quality assertions, and parallel analytics reporting.
 
-This project was developed as part of a data engineering learning path.
+The focus is on orchestration design, reproducibility, and production-readiness: per-step integrity checks, partial failure isolation between reporting branches, and deliberate format choices driven by query performance constraints.
 
 ---
 
-## 🧠 What This POC Demonstrates
+## Architecture decisions
 
-- Data pipeline orchestration with **Kestra**
-- Containerized execution using **Docker**
-- Integration of **Python** scripts in an orchestrator
-- SQL transformations with **DuckDB**
-- Automated data quality checks and assertions
-- Parallel execution of analytical tasks
-- End-to-end pipeline design (ingestion → analytics)
+**CSV → Parquet conversion upfront.**  
+Expected data volume was unknown at design time. Parquet was chosen defensively: columnar storage reduces I/O on projection-heavy queries, and compression lowers storage footprint regardless of scale. Since all downstream transformations run through DuckDB, Parquet is also the natural fit — DuckDB's native Parquet support avoids any parsing overhead that CSV would introduce at each transformation step.
 
----
+**Per-step integrity checks rather than end-to-end only.**  
+Each transformation stage has its own assertions (null checks, uniqueness on business keys, row count consistency after joins). Catching anomalies at the step level isolates root causes — a failure at deduplication doesn't require re-examining the full pipeline output.
 
-## 🗂️ Pipeline Architecture and Workflow
+**Parallel execution with partial failure isolation.**  
+The two analytical reporting branches (revenue per product, z-score anomaly detection) run in parallel. A failure in one branch does not block delivery of the other. This was a deliberate design choice: reporting branches are independent by nature and should not create artificial dependencies.
 
-The pipeline is orchestrated by Kestra and scheduled to run **monthly**.
+**Custom Python Docker image for C-level dependencies.**  
+Kestra's `python.Script` task type does not support installation of packages with C-level dependencies at runtime. FastParquet requires compiled C extensions — packaging them into a custom Docker image was the only viable path. This also has a side benefit: dependency resolution happens at build time, not at each execution, which improves pipeline reliability and execution time.
 
-### Main steps:
-
-1. **Ingestion & Conversion**
-   - Download of a compressed dataset containing Excel files
-   - Extraction and conversion of Excel files to **Parquet**
-   - Validation of conversion using DuckDB
-
-2. **Data Cleaning**
-   - Removal of null values based on business rules
-   - Assertions to ensure no invalid records remain
-
-3. **Deduplication**
-   - Removal of duplicate records using SQL logic
-   - Uniqueness checks on business keys
-
-4. **Dataset Merging**
-   - Joins between ERP, web, and linking datasets
-   - Consistency checks on row counts after merge
-
-5. **Analytics & Export**
-   - Revenue calculation per product and total revenue
-   - Detection of atypical products using **z-score**
-   - Export of results to CSV files
-   - Parallel execution of analytical branches
+**Z-score for atypical product detection.**  
+Business rule requirement. Products with a high z-score on revenue are flagged as vintage/atypical and exported to a separate dataset. The threshold is configurable.
 
 ---
 
-### Pipeline Diagram
+## Pipeline
 
-<img src="./doc/logigramme.png" alt="Kestra pipeline diagram" width="700"/>
-
----
-
-## ⚙️ Tech Stack
-
-- **Orchestration**: Kestra  
-- **Containerization**: Docker, Docker Compose  
-- **Languages**: Python, SQL  
-- **Analytical Engine**: DuckDB  
-- **Data Formats**: Excel, Parquet, CSV  
+![Pipeline diagram](./doc/logigramme.png)
 
 ---
 
-## 🚀 Running the Project
+## Tech stack
+
+| Layer | Tools |
+|---|---|
+| Orchestration | Kestra |
+| Analytical engine | DuckDB |
+| Processing | Python · FastParquet |
+| Data formats | Excel → Parquet → CSV |
+| Infra | Docker · Docker Compose |
+
+---
+
+## Running the project
 
 ### Prerequisites
-Docker & Docker compose
+
+- Docker & Docker Compose
 
 ### Start the services
-Default :
+
 ```bash
-    docker compose up -d
+docker compose up -d
 ```
 
-### Build Custom Python Image
-This project relies on a custom Python Docker image with all dependencies pre-installed.
+### Build the custom Python image
 
-Default :
+Required for FastParquet (C-level dependencies not installable at Kestra runtime):
+
 ```bash
-    docker build -t custom-python-312 .
+docker build -t custom-python-312 .
 ```
 
-### Import the yaml file
-- Open the Kestra UI: http://localhost:8080/
-- Go to Flows > Import
-- Import the POC_pipeline.yml file
+### Import the pipeline
 
-## 📊 Outputs and Results
-The pipeline produces:
-- Cleaned and deduplicated datasets in Parquet format
-- A CSV file with revenue per product and total revenue
-- Two CSV files separating:
-	> vintage products (high z-score)
-	> common products
-- Execution logs, metrics, and assertions available in Kestra
+- Open Kestra UI: http://localhost:8080/
+- Go to **Flows > Import**
+- Import `POC_pipeline.yml`
 
-## 🔍 Possible Improvements
+The pipeline is scheduled monthly. Trigger manually from the UI for immediate execution.
 
-- Schema validation and schema evolution handling
-- Deployment on a cloud environment
-- Storage of outputs in a data lake
-- Advanced monitoring and alerting
-- Parameterization of pipeline inputs
+---
+
+## Outputs
+
+- Cleaned and deduplicated datasets in Parquet
+- `revenue_per_product.csv` — revenue breakdown per product + total
+- `vintage_products.csv` — atypical products (high z-score)
+- `common_products.csv` — standard product set
+- Execution logs, step metrics, and assertion results available in Kestra UI
+
+---
+
+## What's not in scope (and why)
+
+**Cloud storage for outputs** — outputs are written locally. The pipeline structure is storage-agnostic; switching to S3 or GCS would require only a task swap in the Kestra flow, not a pipeline redesign.
+
+**Schema evolution handling** — the input schema is stable for this dataset. Adding schema validation at ingestion is the natural first extension if the source evolves.
+
+---
+
+## Possible extensions
+
+- Schema validation and evolution handling at ingestion
+- Output storage to a data lake (S3 / GCS)
+- Cloud deployment of Kestra
+- Advanced monitoring and alerting on assertion failures
+- Parameterization of pipeline inputs (date range, thresholds)
